@@ -35,6 +35,18 @@
       "type": "youtube_playlist",
       "url": "https://www.youtube.com/playlist?list=PLuMcoKK9mKgHtW_o9h5sGO2vXrffKHwJL",
       "playlistId": "PLuMcoKK9mKgHtW_o9h5sGO2vXrffKHwJL"
+    },
+    {
+      "name": "Lenny's Podcast",
+      "type": "youtube_channel",
+      "url": "https://www.youtube.com/@LennyRachitsky",
+      "channelHandle": "LennyRachitsky"
+    },
+    {
+      "name": "Matthew Berman",
+      "type": "youtube_channel",
+      "url": "https://www.youtube.com/@MatthewBerman",
+      "channelHandle": "MatthewBerman"
     }
   ],
   "blogs": [
