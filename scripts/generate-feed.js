@@ -80,7 +80,7 @@ async function loadSources() {
 
 async function listVideoIds(source) {
   const args = [
-    '--flat-list',
+    '--flat-playlist',
     '--print', 'id',
     '--playlist-end', '5',
     '--no-warnings',
