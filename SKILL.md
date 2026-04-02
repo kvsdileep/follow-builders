@@ -306,13 +306,31 @@ as needed). Then confirm the changes.
 
 ## Content Delivery — Digest Run
 
-This workflow runs on cron schedule or when the user invokes `/ai`.
+This workflow runs when the user invokes `/ai` or `/follow-builders`.
 
-### Step 1: Load Config
+### Step 1: Generate fresh feeds
+
+The scheduled cron is disabled to conserve X API credits. Trigger feed generation
+on demand by running the GitHub Actions workflow, then wait for it to complete:
+
+```bash
+gh workflow run "Generate Feeds" --repo kvsdileep/follow-builders -f mode=all 2>&1
+```
+
+Then poll until the run completes (usually 30-60 seconds):
+```bash
+sleep 5 && gh run list --repo kvsdileep/follow-builders --limit 1 --json status,conclusion -q '.[0]'
+```
+
+If `status` is `completed` and `conclusion` is `success`, proceed. If still
+`in_progress`, wait a few more seconds and check again. Tell the user
+"Generating fresh feeds..." while waiting.
+
+### Step 2: Load Config
 
 Read `~/.follow-builders/config.json` for user preferences.
 
-### Step 2: Run the prepare script
+### Step 3: Run the prepare script
 
 This script handles ALL data fetching deterministically — feeds, prompts, config.
 You do NOT fetch anything yourself.
@@ -332,12 +350,12 @@ The script outputs a single JSON blob with everything you need:
 If the script fails entirely (no JSON output), tell the user to check their
 internet connection. Otherwise, use whatever content is in the JSON.
 
-### Step 3: Check for content
+### Step 4: Check for content
 
 If `stats.podcastEpisodes` is 0 AND `stats.xBuilders` is 0, tell the user:
 "No new updates from your builders today. Check back tomorrow!" Then stop.
 
-### Step 4: Remix content
+### Step 5: Remix content
 
 **Your ONLY job is to remix the content from the JSON.** Do NOT fetch anything
 from the web, visit any URLs, or call any APIs. Everything is in the JSON.
@@ -365,7 +383,7 @@ Assemble the digest following `prompts.digest_intro`.
 - Do NOT guess job titles. Use the `bio` field or just the person's name.
 - Do NOT visit x.com, search the web, or call any API.
 
-### Step 5: Apply language
+### Step 6: Apply language
 
 Read `config.language` from the JSON:
 - **"en":** Entire digest in English.
@@ -393,7 +411,7 @@ Read `config.language` from the JSON:
 
 **Follow this setting exactly. Do NOT mix languages.**
 
-### Step 6: Deliver
+### Step 7: Deliver
 
 Read `config.delivery.method` from the JSON:
 
