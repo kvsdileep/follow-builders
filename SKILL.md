@@ -417,7 +417,7 @@ When the user says something that sounds like a settings change, handle it:
 The source list is managed centrally and cannot be modified by users.
 If a user asks to add or remove sources, tell them: "The source list is curated
 centrally and updates automatically. If you'd like to suggest a source, you can
-open an issue at https://github.com/zarazhangrui/follow-builders."
+open an issue at https://github.com/kvsdileep/follow-builders."
 
 ### Schedule Changes
 - "Switch to weekly/daily" → Update `frequency` in config.json
