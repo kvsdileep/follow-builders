@@ -10,16 +10,20 @@
 // URLs in state-feed.json so content is never repeated across runs.
 //
 // Usage: node generate-feed.js [--tweets-only | --podcasts-only | --blogs-only]
-// Env vars needed: X_BEARER_TOKEN, SUPADATA_API_KEY
+// Env vars needed: X_BEARER_TOKEN
 // ============================================================================
 
-import { readFile, writeFile } from 'fs/promises';
+import { readFile, writeFile, unlink } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join } from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import { tmpdir } from 'os';
+
+const execFileAsync = promisify(execFile);
 
 // -- Constants ---------------------------------------------------------------
 
-const SUPADATA_BASE = 'https://api.supadata.ai/v1';
 const X_API_BASE = 'https://api.x.com/2';
 const TWEET_LOOKBACK_HOURS = 24;
 const PODCAST_LOOKBACK_HOURS = 336; // 14 days — podcasts publish weekly/biweekly, not daily
@@ -72,90 +76,140 @@ async function loadSources() {
   return JSON.parse(await readFile(sourcesPath, 'utf-8'));
 }
 
-// -- YouTube Fetching (Supadata API) -----------------------------------------
+// -- yt-dlp Helpers -----------------------------------------------------------
 
-async function fetchYouTubeContent(podcasts, apiKey, state, errors) {
+async function listVideoIds(source) {
+  const args = [
+    '--flat-list',
+    '--print', 'id',
+    '--playlist-end', '5',
+    '--no-warnings',
+  ];
+
+  let url;
+  if (source.type === 'youtube_playlist') {
+    url = `https://www.youtube.com/playlist?list=${source.playlistId}`;
+  } else {
+    url = `https://www.youtube.com/@${source.channelHandle}/videos`;
+  }
+  args.push(url);
+
+  try {
+    const { stdout } = await execFileAsync('yt-dlp', args, { timeout: 60000 });
+    return stdout.trim().split('\n').filter(Boolean);
+  } catch (err) {
+    console.error(`    yt-dlp list failed for ${source.name}: ${err.message}`);
+    return [];
+  }
+}
+
+async function getVideoMeta(videoId) {
+  try {
+    const { stdout } = await execFileAsync('yt-dlp', [
+      '--print', '%(title)s\n%(upload_date)s',
+      '--no-download',
+      '--no-warnings',
+      `https://www.youtube.com/watch?v=${videoId}`
+    ], { timeout: 30000 });
+    const lines = stdout.trim().split('\n');
+    const title = lines[0] || 'Untitled';
+    const rawDate = lines[1] || '';
+    let publishedAt = null;
+    if (rawDate && rawDate.length === 8) {
+      publishedAt = `${rawDate.slice(0,4)}-${rawDate.slice(4,6)}-${rawDate.slice(6,8)}T00:00:00.000Z`;
+    }
+    return { title, publishedAt };
+  } catch (err) {
+    console.error(`    yt-dlp meta failed for ${videoId}: ${err.message}`);
+    return { title: 'Untitled', publishedAt: null };
+  }
+}
+
+async function getTranscript(videoId) {
+  const tmpBase = join(tmpdir(), `fb-${videoId}`);
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+
+  try {
+    await execFileAsync('yt-dlp', [
+      '--skip-download',
+      '--write-auto-sub',
+      '--write-sub',
+      '--sub-lang', 'en',
+      '--sub-format', 'vtt',
+      '--convert-subs', 'srt',
+      '--no-warnings',
+      '-o', tmpBase,
+      url
+    ], { timeout: 60000 });
+
+    const srtPath = `${tmpBase}.en.srt`;
+    const vttPath = `${tmpBase}.en.vtt`;
+
+    let subsContent = '';
+    for (const p of [srtPath, vttPath]) {
+      if (existsSync(p)) {
+        subsContent = await readFile(p, 'utf-8');
+        await unlink(p).catch(() => {});
+        break;
+      }
+    }
+
+    if (!subsContent) return '';
+
+    const text = subsContent
+      .replace(/^\d+\s*$/gm, '')
+      .replace(/\d{2}:\d{2}:\d{2}[.,]\d+ --> \d{2}:\d{2}:\d{2}[.,]\d+/g, '')
+      .replace(/<[^>]+>/g, '')
+      .replace(/WEBVTT[\s\S]*?\n\n/, '')
+      .replace(/\n{3,}/g, '\n')
+      .trim();
+
+    const lines = text.split('\n').filter(Boolean);
+    const deduped = [];
+    for (const line of lines) {
+      if (deduped.length === 0 || line !== deduped[deduped.length - 1]) {
+        deduped.push(line);
+      }
+    }
+
+    return deduped.join(' ');
+  } catch (err) {
+    console.error(`    yt-dlp transcript failed for ${videoId}: ${err.message}`);
+    for (const ext of ['.en.srt', '.en.vtt']) {
+      await unlink(`${tmpBase}${ext}`).catch(() => {});
+    }
+    return '';
+  }
+}
+
+// -- YouTube Fetching (yt-dlp) ------------------------------------------------
+
+async function fetchYouTubeContent(podcasts, state, errors) {
   const cutoff = new Date(Date.now() - PODCAST_LOOKBACK_HOURS * 60 * 60 * 1000);
   const allCandidates = [];
 
   for (const podcast of podcasts) {
-    try {
-      let videosUrl;
-      if (podcast.type === 'youtube_playlist') {
-        videosUrl = `${SUPADATA_BASE}/youtube/playlist/videos?id=${podcast.playlistId}`;
-      } else {
-        videosUrl = `${SUPADATA_BASE}/youtube/channel/videos?id=${podcast.channelHandle}&type=video`;
-      }
+    console.error(`  ${podcast.name}: listing videos via yt-dlp...`);
+    const videoIds = await listVideoIds(podcast);
+    console.error(`    Found ${videoIds.length} video IDs`);
 
-      const videosRes = await fetch(videosUrl, {
-        headers: { 'x-api-key': apiKey }
-      });
-
-      if (!videosRes.ok) {
-        errors.push(`YouTube: Failed to fetch videos for ${podcast.name}: HTTP ${videosRes.status}`);
+    for (const videoId of videoIds.slice(0, 2)) {
+      if (state.seenVideos[videoId]) {
+        console.error(`    Skipping ${videoId} (already seen)`);
         continue;
       }
 
-      const videosData = await videosRes.json();
-      // Supadata returns videos split into regular, shorts, and live categories.
-      // Podcasts often stream live first, so we must include liveIds too.
-      // We skip shortIds since podcast episodes aren't Shorts.
-      const regularIds = videosData.videoIds || videosData.video_ids || [];
-      const liveIds = videosData.liveIds || videosData.live_ids || [];
-      const videoIds = [...regularIds, ...liveIds];
-
-      console.error(`  ${podcast.name}: found ${regularIds.length} regular + ${liveIds.length} live video IDs`);
-
-      // Check first 2 videos per channel, skip already-seen ones
-      for (const videoId of videoIds.slice(0, 2)) {
-        if (state.seenVideos[videoId]) {
-          console.error(`    Skipping ${videoId} (already seen)`);
-          continue;
-        }
-
-        try {
-          const metaRes = await fetch(
-            `${SUPADATA_BASE}/youtube/video?id=${videoId}`,
-            { headers: { 'x-api-key': apiKey } }
-          );
-          if (!metaRes.ok) {
-            console.error(`    Metadata fetch failed for ${videoId}: HTTP ${metaRes.status}`);
-            errors.push(`YouTube: Metadata fetch failed for ${videoId}: HTTP ${metaRes.status}`);
-            continue;
-          }
-          const meta = await metaRes.json();
-          const publishedAt = meta.uploadDate || meta.publishedAt || meta.date || null;
-
-          console.error(`    Candidate: ${videoId} "${meta.title || 'Untitled'}" published=${publishedAt || 'unknown'}`);
-          allCandidates.push({
-            podcast, videoId,
-            title: meta.title || 'Untitled',
-            publishedAt
-          });
-          await new Promise(r => setTimeout(r, 300));
-        } catch (err) {
-          errors.push(`YouTube: Error fetching metadata for ${videoId}: ${err.message}`);
-        }
-      }
-    } catch (err) {
-      errors.push(`YouTube: Error processing ${podcast.name}: ${err.message}`);
+      const meta = await getVideoMeta(videoId);
+      console.error(`    Candidate: ${videoId} "${meta.title}" published=${meta.publishedAt || 'unknown'}`);
+      allCandidates.push({ podcast, videoId, ...meta });
     }
   }
 
   console.error(`  Total candidates: ${allCandidates.length}, cutoff: ${cutoff.toISOString()}`);
 
-  // Pick 1 unseen video, prioritizing the NEWEST first.
-  // A daily digest should surface fresh content, not work through a backlog
-  // of old episodes. Dedup ensures each is featured exactly once, so older
-  // episodes will naturally get picked on quieter days.
-  //
-  // If publishedAt is missing (API didn't return a date), we still include
-  // the video — it appeared near the top of the channel/playlist listing,
-  // so it's likely recent. Videos without dates sort to the end.
   const withinWindow = allCandidates
     .filter(v => !v.publishedAt || new Date(v.publishedAt) >= cutoff)
     .sort((a, b) => {
-      // Newest first; dateless ones go to the end
       if (a.publishedAt && b.publishedAt) return new Date(b.publishedAt) - new Date(a.publishedAt);
       if (a.publishedAt) return -1;
       if (b.publishedAt) return 1;
@@ -163,55 +217,28 @@ async function fetchYouTubeContent(podcasts, apiKey, state, errors) {
     });
 
   console.error(`  Within window: ${withinWindow.length} video(s)`);
-  for (const v of withinWindow) {
-    console.error(`    - ${v.videoId} "${v.title}" published=${v.publishedAt || 'unknown'}`);
-  }
 
-  // Try each candidate in order until we find one with a transcript.
-  // Some videos don't have captions/transcripts on YouTube — skip those
-  // and try the next candidate rather than publishing an empty entry.
   for (const selected of withinWindow) {
-    try {
-      const videoUrl = `https://www.youtube.com/watch?v=${selected.videoId}`;
-      const transcriptRes = await fetch(
-        `${SUPADATA_BASE}/youtube/transcript?url=${encodeURIComponent(videoUrl)}&text=true`,
-        { headers: { 'x-api-key': apiKey } }
-      );
+    console.error(`    Fetching transcript for ${selected.videoId}...`);
+    const transcript = await getTranscript(selected.videoId);
 
-      if (!transcriptRes.ok) {
-        console.error(`    Transcript fetch failed for ${selected.videoId}: HTTP ${transcriptRes.status}`);
-        errors.push(`YouTube: Failed to get transcript for ${selected.videoId}: HTTP ${transcriptRes.status}`);
-        // Mark as seen so we don't retry a broken video every day
-        state.seenVideos[selected.videoId] = Date.now();
-        continue;
-      }
+    state.seenVideos[selected.videoId] = Date.now();
 
-      const transcriptData = await transcriptRes.json();
-      const transcript = transcriptData.content || '';
-
-      // Mark as seen regardless — even if transcript is empty, don't retry daily
-      state.seenVideos[selected.videoId] = Date.now();
-
-      if (!transcript) {
-        console.error(`    No transcript available for ${selected.videoId} "${selected.title}" — skipping to next candidate`);
-        continue;
-      }
-
-      console.error(`    Selected: ${selected.videoId} "${selected.title}" (transcript: ${transcript.length} chars)`);
-      return [{
-        source: 'podcast',
-        name: selected.podcast.name,
-        title: selected.title,
-        videoId: selected.videoId,
-        url: `https://youtube.com/watch?v=${selected.videoId}`,
-        publishedAt: selected.publishedAt,
-        transcript
-      }];
-    } catch (err) {
-      errors.push(`YouTube: Error fetching transcript for ${selected.videoId}: ${err.message}`);
-      state.seenVideos[selected.videoId] = Date.now();
+    if (!transcript) {
+      console.error(`    No transcript available for ${selected.videoId} — skipping`);
       continue;
     }
+
+    console.error(`    Selected: ${selected.videoId} "${selected.title}" (transcript: ${transcript.length} chars)`);
+    return [{
+      source: 'podcast',
+      name: selected.podcast.name,
+      title: selected.title,
+      videoId: selected.videoId,
+      url: `https://youtube.com/watch?v=${selected.videoId}`,
+      publishedAt: selected.publishedAt,
+      transcript
+    }];
   }
 
   console.error(`    No candidates had transcripts available`);
@@ -651,12 +678,7 @@ async function main() {
   const runBlogs = blogsOnly || (!tweetsOnly && !podcastsOnly);
 
   const xBearerToken = process.env.X_BEARER_TOKEN;
-  const supadataKey = process.env.SUPADATA_API_KEY;
 
-  if (runPodcasts && !supadataKey) {
-    console.error('SUPADATA_API_KEY not set');
-    process.exit(1);
-  }
   if (runTweets && !xBearerToken) {
     console.error('X_BEARER_TOKEN not set');
     process.exit(1);
@@ -688,7 +710,7 @@ async function main() {
   // Fetch podcasts
   if (runPodcasts) {
     console.error('Fetching YouTube content...');
-    const podcasts = await fetchYouTubeContent(sources.podcasts, supadataKey, state, errors);
+    const podcasts = await fetchYouTubeContent(sources.podcasts, state, errors);
     console.error(`  Found ${podcasts.length} new episodes`);
 
     const podcastFeed = {
